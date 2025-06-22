@@ -7,12 +7,14 @@ from torch_geometric.nn import knn_graph
 from einops import rearrange
 import math
 from timm.layers import DropPath, trunc_normal_
+from operator import mul
+from functools import reduce
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Sinkhorn Matching Loss
 class SinkhornMatchingLoss(nn.Module):
-    def __init__(self, num_iter=10, tau=0.05, eps=1e-8):
+    def __init__(self, num_iter=5, tau=0.05, eps=1e-8):
         super().__init__()
         self.num_iter = num_iter
         self.tau = tau
@@ -20,30 +22,21 @@ class SinkhornMatchingLoss(nn.Module):
 
     def forward(self, source_nodes, target_nodes):
         B, T, N, D = source_nodes.shape
-        total_loss = 0.0
-
-        # Xử lý từng batch và frame để tránh out-of-memory
-        for b in range(B):
-            for t in range(T):
-                src = source_nodes[b, t]  # [N, D]
-                tgt = target_nodes[b, t]  # [N, D]
-                cost_matrix = torch.cdist(src, tgt, p=2)  # [N, N]
-                K = torch.exp(-cost_matrix / self.tau)
-
-                mu = torch.full((N,), 1.0 / N, device=device)
-                nu = torch.full((N,), 1.0 / N, device=device)
-                u = torch.ones_like(mu)
-                v = torch.ones_like(nu)
-
-                for _ in range(self.num_iter):
-                    u = mu / (K @ v + self.eps)
-                    v = nu / (K.t() @ u + self.eps)
-
-                pi = torch.diag(u) @ K @ torch.diag(v)
-                frame_loss = torch.sum(pi * cost_matrix)
-                total_loss += frame_loss
-
-        return total_loss / (B * T)
+        src = source_nodes.view(B * T, N, D)
+        tgt = target_nodes.view(B * T, N, D)
+        cost_matrix = torch.cdist(src, tgt, p=2)
+        K = torch.exp(-cost_matrix / self.tau)
+        mu = torch.full((B * T, N), 1.0 / N, device=device)
+        nu = torch.full((B * T, N), 1.0 / N, device=device)
+        u = torch.ones_like(mu)
+        v = torch.ones_like(nu)
+        for _ in range(self.num_iter):
+            u = mu / (torch.bmm(K, v.unsqueeze(-1)).squeeze(-1) + self.eps)
+            v = nu / (torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1) + self.eps)
+        pi = u.unsqueeze(-1) * K * v.unsqueeze(-2)
+        frame_loss = torch.sum(pi * cost_matrix, dim=(1, 2))
+        total_loss = frame_loss.mean()
+        return total_loss
 
 # Patch Embedding
 class PatchEmbed3D(nn.Module):
@@ -86,20 +79,156 @@ class AbsolutePositionalEmbedding(nn.Module):
         pos_t = torch.arange(t, device=x.device)
         pos_h = torch.arange(h, device=x.device)
         pos_w = torch.arange(w, device=x.device)
-        embed_dim = self.emb_t.embedding_dim  # Lấy embed_dim từ embedding layer
-
-        # Sửa shape của pos_emb_t, pos_emb_h, pos_emb_w
+        embed_dim = self.emb_t.embedding_dim
         pos_emb_t = self.emb_t(pos_t).permute(1, 0).view(1, embed_dim, t, 1, 1) * self.scale
         pos_emb_h = self.emb_h(pos_h).permute(1, 0).view(1, embed_dim, 1, h, 1) * self.scale
         pos_emb_w = self.emb_w(pos_w).permute(1, 0).view(1, embed_dim, 1, 1, w) * self.scale
-
         x = x + pos_emb_t + pos_emb_h + pos_emb_w
-
         if self.post_norm is not None:
             x = rearrange(x, 'b c t h w -> b t h w c')
             x = self.post_norm(x)
             x = rearrange(x, 'b t h w c -> b c t h w')
+        return x
 
+# Swin Transformer Components
+def window_partition(x, window_size):
+    B, D, H, W, C = x.shape
+    x = x.view(B, D // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2], window_size[2], C)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, reduce(mul, window_size), C)
+    return windows
+
+def window_reverse(windows, window_size, B, D, H, W):
+    x = windows.view(B, D // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1], window_size[2], -1)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+    return x
+
+def get_window_size(x_size, window_size, shift_size=None):
+    D, H, W = x_size
+    D = min(D, window_size[0])
+    H = min(H, window_size[1])
+    W = min(W, window_size[2])
+    new_window_size = (D, H, W)
+    new_shift_size = shift_size if shift_size is not None else (0, 0, 0)
+    return new_window_size, new_shift_size
+
+class WindowAttention3D(nn.Module):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, batch_size=8, frame_len=8):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        scale = 1.0 / math.sqrt(C // self.num_heads)
+        scores = torch.einsum("b h n c, b h m c -> b h n m", q, k) * scale
+        attn = F.softmax(scores, dim=-1)
+        if self.training:
+            attn = F.dropout(attn, p=self.attn_drop.p)
+        self.last_attn = attn
+        attn_output = torch.einsum("b h n m, b h m c -> b h n c", attn, v)
+        attn_output = attn_output.transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(attn_output)
+        x = self.proj_drop(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer='swish', drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.SiLU() if act_layer == 'swish' else nn.GELU()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class SwinTransformerBlock3D(nn.Module):
+    def __init__(self, dim, num_heads, window_size=(1,4,4), shift_size=(0,0,0), mlp_ratio=4., qkv_bias=True,
+                 drop=0., attn_drop=0., drop_path=0., act_layer='swish', norm_layer=nn.LayerNorm,
+                 use_checkpoint=False):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.use_checkpoint = use_checkpoint
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention3D(
+            dim, window_size=self.window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward_part1(self, x):
+        B, D, H, W, C = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+        x = self.norm1(x)
+        pad_l = pad_t = pad_d0 = 0
+        pad_d1 = (window_size[0] - D % window_size[0]) % window_size[0]
+        pad_b = (window_size[1] - H % window_size[1]) % window_size[1]
+        pad_r = (window_size[2] - W % window_size[2]) % window_size[2]
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
+        _, Dp, Hp, Wp, _ = x.shape
+        if any(i > 0 for i in shift_size):
+            shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
+        else:
+            shifted_x = x
+        x_windows = window_partition(shifted_x, window_size)
+        attn_windows = self.attn(x_windows, batch_size=B, frame_len=D)
+        attn_windows = attn_windows.view(-1, *(window_size+(C,)))
+        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)
+        if any(i > 0 for i in shift_size):
+            x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
+        else:
+            x = shifted_x
+        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
+            x = x[:, :D, :H, :W, :].contiguous()
+        return x
+
+    def forward_part2(self, x):
+        return self.drop_path(self.mlp(self.norm2(x)))
+
+    def forward(self, x):
+        shortcut = x
+        x = self.forward_part1(x)
+        x = shortcut + self.drop_path(x)
+        x = x + self.forward_part2(x)
+        return x
+
+class SwinTransformer3D(nn.Module):
+    def __init__(self, dim, num_heads, window_size, num_layers=12, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., 
+                 drop_path=0., act_layer='swish', norm_layer=nn.LayerNorm, use_checkpoint=False):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            SwinTransformerBlock3D(
+                dim=dim, num_heads=num_heads, window_size=window_size,
+                shift_size=(0,0,0) if (i % 2 == 0) else (window_size[0]//2, window_size[1]//2, window_size[2]//2),
+                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop, attn_drop=attn_drop,
+                drop_path=drop_path, act_layer=act_layer, norm_layer=norm_layer, use_checkpoint=use_checkpoint
+            )
+            for i in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
         return x
 
 # Graph Convolutional Block
@@ -138,7 +267,7 @@ class RGCC(nn.Module):
 class Reperio(nn.Module):
     def __init__(
         self,
-        patch_size=(1, 32, 32),
+        patch_size=(1, 16, 16),
         input_resolution=128,
         embed_dim=192,
         gcn_dim=128,
@@ -156,6 +285,22 @@ class Reperio(nn.Module):
         self.patch_embed = PatchEmbed3D(patch_size=patch_size, in_chans=3, embed_dim=embed_dim, norm_layer=norm_layer)
         self.pos_embed = AbsolutePositionalEmbedding(embed_dim, (num_frames, input_resolution // patch_size[1], input_resolution // patch_size[2]), norm_layer)
         self.pos_drop = nn.Dropout(p=drop_rate)
+        
+        self.swin_transformer = SwinTransformer3D(
+            dim=embed_dim,
+            num_heads=8,  # embed_dim=192 chia hết cho 6
+            window_size=(1, 4, 4),  # Phù hợp với T_p=180, H_p=4, W_p=4 sau patch_embed
+            num_layers=12,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            drop=drop_rate,
+            attn_drop=0.,
+            drop_path=0.,
+            act_layer='swish',
+            norm_layer=norm_layer,
+            use_checkpoint=False
+        )
+        
         self.gcn = GCNBlock(embed_dim, gcn_dim)
         self.rgcc = RGCC(gcn_dim, rgcc_hidden_dim)
         self.final_linear = nn.Linear(rgcc_hidden_dim, 1)
@@ -190,6 +335,12 @@ class Reperio(nn.Module):
         B, C, T, H, W = src.shape
         src = self.patch_embed(src)
         src = self.pos_drop(self.pos_embed(src))
+        
+        # Qua Swin Transformer
+        src = rearrange(src, 'b c t h w -> b t h w c')
+        src = self.swin_transformer(src)
+        src = rearrange(src, 'b t h w c -> b c t h w')
+        
         _, feat_dim, T_p, H_p, W_p = src.shape
         N = H_p * W_p
         src_nodes, src_edges = self.build_local_graph(src)
@@ -200,6 +351,9 @@ class Reperio(nn.Module):
             tgt = self.preprocess(target_x)
             tgt = self.patch_embed(tgt)
             tgt = self.pos_drop(self.pos_embed(tgt))
+            tgt = rearrange(tgt, 'b c t h w -> b t h w c')
+            tgt = self.swin_transformer(tgt)
+            tgt = rearrange(tgt, 'b t h w c -> b c t h w')
             tgt_nodes, tgt_edges = self.build_local_graph(tgt)
             tgt_nodes = self.gcn(tgt_nodes, tgt_edges)
             src_4d = src_nodes.view(B, T, N, -1)
@@ -215,8 +369,7 @@ class Reperio(nn.Module):
         
         return preds, matching_loss
 
-
-    @torch.no_grad()  
+    @torch.no_grad()
     def predict(self, x):
         preds, _ = self.forward(x)
         return preds
