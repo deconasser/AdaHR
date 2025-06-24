@@ -111,13 +111,19 @@ def window_reverse(windows, window_size, B, D, H, W):
     return x
 
 def get_window_size(x_size, window_size, shift_size=None):
-    D, H, W = x_size
-    D = min(D, window_size[0])
-    H = min(H, window_size[1])
-    W = min(W, window_size[2])
-    new_window_size = (D, H, W)
-    new_shift_size = shift_size if shift_size is not None else (0, 0, 0)
-    return new_window_size, new_shift_size
+    use_window_size = list(window_size)
+    if shift_size is not None:
+        use_shift_size = list(shift_size)
+    for i in range(len(x_size)):
+        if x_size[i] <= window_size[i]:
+            use_window_size[i] = x_size[i]
+            if shift_size is not None:
+                use_shift_size[i] = 0
+
+    if shift_size is None:
+        return tuple(use_window_size)
+    else:
+        return tuple(use_window_size), tuple(use_shift_size)
 
 class WindowAttention3D(nn.Module):
     def __init__(self, dim, window_size, num_heads, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -176,9 +182,15 @@ class SwinTransformerBlock3D(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint = use_checkpoint
         self.norm1 = norm_layer(dim)
+
+        assert 0 <= self.shift_size[0] < self.window_size[0], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[1] < self.window_size[1], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[2] < self.window_size[2], "shift_size must in 0-window_size"
+                     
         self.attn = WindowAttention3D(
             dim, window_size=self.window_size, num_heads=num_heads,
             qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+                     
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -219,26 +231,7 @@ class SwinTransformerBlock3D(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.forward_part2(x)
         return x
-
-class SwinTransformer3D(nn.Module):
-    def __init__(self, dim, num_heads, window_size, num_layers=12, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., 
-                 drop_path=0., act_layer='swish', norm_layer=nn.LayerNorm, use_checkpoint=False):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            SwinTransformerBlock3D(
-                dim=dim, num_heads=num_heads, window_size=window_size,
-                shift_size=(0,0,0) if (i % 2 == 0) else (window_size[0]//2, window_size[1]//2, window_size[2]//2),
-                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop, attn_drop=attn_drop,
-                drop_path=drop_path, act_layer=act_layer, norm_layer=norm_layer, use_checkpoint=use_checkpoint
-            )
-            for i in range(num_layers)
-        ])
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
+        
 # Graph Convolutional Block
 class GCNBlock(nn.Module):
     def __init__(self, in_dim, out_dim, num_layers=2):
@@ -278,13 +271,23 @@ class Reperio(nn.Module):
         patch_size=(1, 16, 16),
         input_resolution=128,
         embed_dim=192,
+        act_layer='swish',
+        depth=12,
+        num_heads=8,
+        window_size=(1,4,4),
+        mlp_ratio=4.,
         gcn_dim=128,
         rgcc_hidden_dim=128,
         k_neighbors=5,
         num_frames=180,
         norm_layer=nn.LayerNorm,
         drop_rate=0.0,
+        attn_drop_rate=0.,
+        drop_path_rate=0.2,
         post_pos_norm=True,
+        use_checkpoint=False,
+        patch_norm=False,
+        qkv_bias=True,
         **kwargs,
     ):
         super().__init__()
@@ -292,28 +295,36 @@ class Reperio(nn.Module):
         self.num_frames = num_frames
         self.k_neighbors = k_neighbors
 
-        self.patch_embed = PatchEmbed3D(patch_size=patch_size, in_chans=3, embed_dim=embed_dim, norm_layer=norm_layer)
+        self.patch_embed = PatchEmbed3D(
+            patch_size=patch_size, in_chans=3, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+        
         self.pos_embed = AbsolutePositionalEmbedding(
             embed_dim,
             max_seq_len=(1800, math.ceil(input_resolution/patch_size[1]), math.ceil(input_resolution/patch_size[2])),
             post_norm=norm_layer if post_pos_norm else None,
         )
         self.pos_drop = nn.Dropout(p=drop_rate)
+        drop_path_rate = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        self.shift_size = tuple(i // 2 for i in window_size)
         
-        self.swin_transformer = SwinTransformer3D(
-            dim=embed_dim,
-            num_heads=8,  # embed_dim=192 chia hết cho 6
-            window_size=(1, 4, 4),  # Phù hợp với T_p=180, H_p=4, W_p=4 sau patch_embed
-            num_layers=12,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            drop=drop_rate,
-            attn_drop=0.,
-            drop_path=0.2,
-            act_layer='swish',
-            norm_layer=norm_layer,
-            use_checkpoint=False
-        )
+        self.swin_transformer = nn.ModuleList([
+            SwinTransformerBlock3D(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=(0,0,0) if (i % 2 == 0) else self.shift_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=drop_path[i] if isinstance(drop_path_rate, list) else drop_path_rate,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                use_checkpoint=use_checkpoint,
+            )
+            for i in range(depth)])
         
         self.gcn = GCNBlock(embed_dim, gcn_dim)
         self.rgcc = RGCC(gcn_dim, rgcc_hidden_dim)
