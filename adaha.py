@@ -40,27 +40,35 @@ class SinkhornMatchingLoss(nn.Module):
 
 # Patch Embedding
 class PatchEmbed3D(nn.Module):
-    def __init__(self, patch_size=(1, 32, 32), in_chans=3, embed_dim=192, norm_layer=None):
+    def __init__(self, patch_size=(1,4,4), in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         self.patch_size = patch_size
+
         self.in_chans = in_chans
         self.embed_dim = embed_dim
+
         self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = norm_layer(embed_dim) if norm_layer else None
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
 
     def forward(self, x):
-        _, _, T, H, W = x.size()
-        for i, (dim, patch_dim) in enumerate(zip([T, H, W], self.patch_size)):
-            if dim % patch_dim != 0:
-                pad = [0] * (2 * 5)
-                pad[2 * (4 - i) + 1] = patch_dim - dim % patch_dim
-                x = F.pad(x, pad)
-        x = self.proj(x)
-        if self.norm:
-            T_p, H_p, W_p = x.size(2), x.size(3), x.size(4)
+        _, _, D, H, W = x.size()
+        if W % self.patch_size[2] != 0:
+            x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
+        if H % self.patch_size[1] != 0:
+            x = F.pad(x, (0, 0, 0, self.patch_size[1] - H % self.patch_size[1]))
+        if D % self.patch_size[0] != 0:
+            x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - D % self.patch_size[0]))
+
+        x = self.proj(x)  # B C D Wh Ww
+        if self.norm is not None:
+            D, Wh, Ww = x.size(2), x.size(3), x.size(4)
             x = x.flatten(2).transpose(1, 2)
             x = self.norm(x)
-            x = x.transpose(1, 2).view(-1, self.embed_dim, T_p, H_p, W_p)
+            x = x.transpose(1, 2).view(-1, self.embed_dim, D, Wh, Ww)
+
         return x
 
 # Positional Embedding
@@ -275,7 +283,9 @@ class Reperio(nn.Module):
         k_neighbors=5,
         num_frames=180,
         norm_layer=nn.LayerNorm,
-        drop_rate=0.0
+        drop_rate=0.0,
+        post_pos_norm=True,
+        **kwargs,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -283,7 +293,11 @@ class Reperio(nn.Module):
         self.k_neighbors = k_neighbors
 
         self.patch_embed = PatchEmbed3D(patch_size=patch_size, in_chans=3, embed_dim=embed_dim, norm_layer=norm_layer)
-        self.pos_embed = AbsolutePositionalEmbedding(embed_dim, (num_frames, input_resolution // patch_size[1], input_resolution // patch_size[2]), norm_layer)
+        self.pos_embed = AbsolutePositionalEmbedding(
+            embed_dim,
+            max_seq_len=(1800, math.ceil(input_resolution/patch_size[1]), math.ceil(input_resolution/patch_size[2])),
+            post_norm=norm_layer if post_pos_norm else None,
+        )
         self.pos_drop = nn.Dropout(p=drop_rate)
         
         self.swin_transformer = SwinTransformer3D(
@@ -295,7 +309,7 @@ class Reperio(nn.Module):
             qkv_bias=True,
             drop=drop_rate,
             attn_drop=0.,
-            drop_path=0.,
+            drop_path=0.2,
             act_layer='swish',
             norm_layer=norm_layer,
             use_checkpoint=False
